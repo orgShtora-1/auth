@@ -3,6 +3,7 @@ import {
   createAuth,
   type AuthActionTokenStore,
   type AuthUser,
+  type PasswordPolicy,
   type SessionStore,
   type StoredSession,
   type UserStore,
@@ -19,8 +20,11 @@ function setup(options: {
   verification?: boolean;
   reset?: boolean;
   sendFailure?: boolean;
+  passwordPolicy?: PasswordPolicy;
+  identity?: { registration?: "email" | "username" | "both" | "either"; login?: "email" | "username" | "either" };
 } = {}) {
   const usersByEmail = new Map<string, TestUser>();
+  const usersByUsername = new Map<string, TestUser>();
   const usersById = new Map<string, TestUser>();
   const passwords = new Map<string, string>();
   const sessions = new Map<string, StoredSession>();
@@ -52,12 +56,21 @@ function setup(options: {
     },
   };
   const users: UserStore<TestUser> = {
+    async findByIdentifier({ type, value }) {
+      return (type === "email" ? usersByEmail : usersByUsername).get(value) ?? null;
+    },
     async findByEmail(email) { return usersByEmail.get(email) ?? null; },
     async findById(id) { return usersById.get(id) ?? null; },
-    async create({ email, password: newPassword }) {
-      if (usersByEmail.has(email)) return { created: false };
-      const user = { id: `user-${usersById.size + 1}`, email, verified: false };
-      usersByEmail.set(email, user);
+    async create({ email, username, password: newPassword }) {
+      if ((email && usersByEmail.has(email)) || (username && usersByUsername.has(username))) return { created: false };
+      const user: TestUser = {
+        id: `user-${usersById.size + 1}`,
+        ...(email === undefined ? {} : { email }),
+        ...(username === undefined ? {} : { username }),
+        verified: false,
+      };
+      if (email) usersByEmail.set(email, user);
+      if (username) usersByUsername.set(username, user);
       usersById.set(user.id, user);
       passwords.set(user.id, newPassword);
       return { created: true, user };
@@ -117,6 +130,8 @@ function setup(options: {
         async setPassword({ userId, password: newPassword }) { passwords.set(userId, newPassword); },
       },
     } : {}),
+    ...(options.identity ? { identity: options.identity } : {}),
+    ...(options.passwordPolicy ? { passwordPolicy: options.passwordPolicy } : {}),
     onError({ operation }) { errors.push(operation); },
   });
   return { auth, usersByEmail, sessions, tokens, delivered, errors };
@@ -188,6 +203,35 @@ describe("email verification and password recovery", () => {
     expect((await send(state.auth, "password-reset/confirm", { token, password: "Another-password-789" })).status).toBe(400);
   });
 
+  test("rejects incompatible email verification modes at setup", () => {
+    expect(() => setup({ verification: true, identity: { registration: "either", login: "either" } })).toThrow(
+      "emailVerification requires registration mode 'email' or 'both'",
+    );
+  });
+
+  test("validates reset passwords before consuming tokens or revoking sessions", async () => {
+    const state = setup({ reset: true, passwordPolicy: { requireUppercase: true } });
+    await register(state.auth);
+    await sessionRequest(state.auth, password);
+    const sessionsBeforeReset = state.sessions.size;
+    await send(state.auth, "password-reset/request", { email: "person@example.test" });
+    const token = state.delivered[0]!.token;
+
+    expect((await send(state.auth, "password-reset/confirm", { token, password: "lowercase-123" })).status).toBe(400);
+    expect(state.tokens.has(`password-reset:${await digest(token)}`)).toBe(true);
+    expect(state.sessions.size).toBe(sessionsBeforeReset);
+    expect((await send(state.auth, "password-reset/confirm", { token, password: "New-password-456" })).status).toBe(204);
+  });
+
+  test("username-only accounts cannot request password reset by username", async () => {
+    const state = setup({ reset: true, identity: { registration: "username", login: "username" } });
+    expect((await send(state.auth, "register", { username: "alice", password })).status).toBe(202);
+    const existing = await send(state.auth, "password-reset/request", { email: "alice@example.test" });
+    const missing = await send(state.auth, "password-reset/request", { email: "missing@example.test" });
+    expect(existing.status).toBe(202);
+    expect(await existing.text()).toBe(await missing.text());
+    expect(state.delivered).toHaveLength(0);
+  });
   test("delivery failures preserve generic registration responses and are observed", async () => {
     const state = setup({ verification: true, sendFailure: true });
     expect((await register(state.auth)).status).toBe(202);

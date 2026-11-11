@@ -57,7 +57,7 @@
     "@simplewebauthn/server": { "optional": true },
     "openid-client": { "optional": true }
   },
-  "files": ["dist", "migrations"],
+  "files": ["dist"],
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

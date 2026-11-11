@@ -1,11 +1,12 @@
 import { clearedSessionCookie, readSessionToken, sessionCookie } from "./cookies.js";
 import { createSessionToken, hashSessionToken } from "./crypto.js";
-import { parseActionTokenRequest, parseCredentials, parseEmailRequest, parsePasswordReset, readJson, RequestError } from "./request.js";
+import { parseActionTokenRequest, parseEmailRequest, parseLoginCredentials, parsePasswordReset, parseRegistrationCredentials, readJson, RequestError } from "./request.js";
 import type {
   AccessPolicy,
   AuthActionTokenPurpose,
   AuthActionTokenStore,
   AuthApi,
+  AuthIdentifier,
   AuthenticatedUser,
   AuthOptions,
   AuthUser,
@@ -24,12 +25,41 @@ const defaultVerificationTokenTtl = 60 * 60;
 const defaultResetTokenTtl = 15 * 60;
 const maxActionTokenTtl = 60 * 60 * 24;
 
+const defaultPasswordPolicy = { minLength: 1, maxLength: 4096 };
+const hardMaxPasswordLength = 4096;
 export function createAuth<User extends AuthUser>(options: AuthOptions<User>): AuthApi {
   const basePath = options.basePath ?? defaultBasePath;
   const cookieName = options.cookieName ?? defaultCookieName;
   const sessionTtlSeconds = options.sessionTtlSeconds ?? defaultSessionTtl;
   const maxRequestBytes = options.maxRequestBytes ?? defaultMaxRequestBytes;
   const requireOrigin = options.requireOrigin ?? true;
+  const registrationMode = options.identity?.registration ?? "email";
+  const loginMode = options.identity?.login ?? "email";
+  const passwordPolicy = { ...defaultPasswordPolicy, ...options.passwordPolicy };
+  if (!["email", "username", "both", "either"].includes(registrationMode) ||
+      !["email", "username", "either"].includes(loginMode)) {
+    throw new TypeError("identity modes are invalid");
+  }
+  if ((registrationMode === "email" && loginMode !== "email") ||
+      (registrationMode === "username" && loginMode !== "username") ||
+      (registrationMode === "either" && loginMode !== "either")) {
+    throw new TypeError("identity login mode is incompatible with registration mode");
+  }
+  if (!Number.isInteger(passwordPolicy.minLength) || passwordPolicy.minLength < 1 ||
+      !Number.isInteger(passwordPolicy.maxLength) || passwordPolicy.maxLength > hardMaxPasswordLength ||
+      passwordPolicy.maxLength < passwordPolicy.minLength) {
+    throw new RangeError("passwordPolicy lengths must be integers between 1 and 4096 with minLength <= maxLength");
+  }
+  for (const flag of [
+    options.passwordPolicy?.requireUppercase,
+    options.passwordPolicy?.requireLowercase,
+    options.passwordPolicy?.requireSpecial,
+  ]) {
+    if (flag !== undefined && typeof flag !== "boolean") throw new TypeError("passwordPolicy requirements must be booleans");
+  }
+  if (options.emailVerification && registrationMode !== "email" && registrationMode !== "both") {
+    throw new TypeError("emailVerification requires registration mode 'email' or 'both'");
+  }
 
   if (!basePath.startsWith("/") || basePath.endsWith("/") || basePath.includes("?")) {
     throw new TypeError("basePath must start with '/' and must not end with '/'");
@@ -50,6 +80,26 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 1 || ttl > maxActionTokenTtl)) {
       throw new RangeError("tokenTtlSeconds must be between 1 and 86400");
     }
+  }
+  function passwordAllowed(password: string): boolean {
+    let length = 0;
+    for (const _character of password) length += 1;
+    return length >= passwordPolicy.minLength &&
+      length <= passwordPolicy.maxLength &&
+      (!options.passwordPolicy?.requireUppercase || /\p{Lu}/u.test(password)) &&
+      (!options.passwordPolicy?.requireLowercase || /\p{Ll}/u.test(password)) &&
+      (!options.passwordPolicy?.requireSpecial || /[^\p{L}\p{N}\p{White_Space}]/u.test(password));
+  }
+
+  function requirePasswordPolicy(password: string): void {
+    if (!passwordAllowed(password)) throw new RequestError(400, "invalid_request");
+  }
+
+  function requireEmail(user: User): string {
+    if (typeof user.email !== "string" || user.email.length === 0) {
+      throw new TypeError("UserStore returned a user without an email");
+    }
+    return user.email;
   }
 
   async function isAllowed(policy: AccessPolicy | undefined, value: string, request: Request): Promise<boolean> {
@@ -121,11 +171,32 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     }
   }
 
-  function publicUser(user: User): AuthenticatedUser {
-    if (typeof user.id !== "string" || user.id.length === 0 || typeof user.email !== "string") {
-      throw new TypeError("UserStore returned an invalid user");
+  function assertUserIdentity(user: User): void {
+    const validEmail = user.email === undefined ||
+      (typeof user.email === "string" && user.email.length <= 254 && user.email.includes("@") &&
+        !/\s/.test(user.email) && user.email === user.email.toLowerCase());
+    const validUsername = user.username === undefined ||
+      (typeof user.username === "string" && /^[a-z0-9._-]{3,32}$/.test(user.username));
+    const hasEmail = user.email !== undefined;
+    const hasUsername = user.username !== undefined;
+    const modeSatisfied =
+      (registrationMode === "email" && hasEmail && !hasUsername) ||
+      (registrationMode === "username" && hasUsername && !hasEmail) ||
+      (registrationMode === "both" && hasEmail && hasUsername) ||
+      (registrationMode === "either" && hasEmail !== hasUsername);
+    if (typeof user.id !== "string" || user.id.length === 0 || !validEmail || !validUsername || !modeSatisfied) {
+      throw new TypeError("UserStore returned an invalid user identity");
     }
-    return { id: user.id, email: user.email };
+  }
+
+  function publicUser(user: User): AuthenticatedUser {
+    return {
+      id: user.id,
+      ...(["email", "both"].includes(registrationMode) && user.email !== undefined ? { email: user.email } : {}),
+      ...(["username", "both"].includes(registrationMode) && user.username !== undefined ? { username: user.username } : {}),
+      ...(registrationMode === "either" && user.email !== undefined ? { email: user.email } : {}),
+      ...(registrationMode === "either" && user.username !== undefined ? { username: user.username } : {}),
+    };
   }
 
   async function getSession(request: Request): Promise<AuthenticatedUser | null> {
@@ -145,8 +216,9 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
         await options.sessions.deleteByTokenHash(tokenHash);
         return null;
       }
+      assertUserIdentity(user);
       if (options.emailVerification && !options.emailVerification.isVerified(user)) return null;
-      if (!(await isAllowed(options.emailPolicy, user.email, request))) return null;
+      if (options.emailPolicy && (!user.email || !(await isAllowed(options.emailPolicy, user.email, request)))) return null;
       if (options.ipPolicy) {
         const ip = await clientIp(request);
         if (!ip || !(await isAllowed(options.ipPolicy, ip, request))) return null;
@@ -160,7 +232,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
 
   async function rateLimit(
     action: "register" | "login" | "email-verification" | "password-reset",
-    email: string,
+    identifier: AuthIdentifier,
     request: Request,
   ): Promise<Response | null> {
     if (!options.rateLimiter) return null;
@@ -169,7 +241,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
       if (action === "login") return response({ error: "invalid_credentials" }, 401);
       return response({ status: "accepted" }, 202);
     }
-    const result = await options.rateLimiter.check({ action, email, ip });
+    const result = await options.rateLimiter.check({ action, identifier, ip });
     if (result.allowed) return null;
     const seconds = Number.isInteger(result.retryAfterSeconds) && result.retryAfterSeconds! > 0
       ? result.retryAfterSeconds!
@@ -196,26 +268,31 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     }
   }
 
-  async function passPolicies(email: string, request: Request): Promise<boolean> {
-    if (!(await isAllowed(options.emailPolicy, email, request))) return false;
+  async function passPolicies(email: string | undefined, request: Request): Promise<boolean> {
+    if (options.emailPolicy && (!email || !(await isAllowed(options.emailPolicy, email, request)))) return false;
     if (!options.ipPolicy) return true;
     const ip = await clientIp(request);
     return ip !== null && isAllowed(options.ipPolicy, ip, request);
   }
 
   async function register(request: Request): Promise<Response> {
-    const credentials = parseCredentials(await readJson(request, maxRequestBytes));
-    const limited = await rateLimit("register", credentials.email, request);
+    const credentials = parseRegistrationCredentials(await readJson(request, maxRequestBytes), registrationMode);
+    requirePasswordPolicy(credentials.password);
+    const identifier: AuthIdentifier = credentials.email !== undefined
+      ? { type: "email", value: credentials.email }
+      : { type: "username", value: credentials.username! };
+    const limited = await rateLimit("register", identifier, request);
     if (limited) return limited;
     if (!(await passPolicies(credentials.email, request))) return response({ status: "accepted" }, 202);
-    const created = await options.users.create({ email: credentials.email, password: credentials.password });
+    const created = await options.users.create(credentials);
     if (created.created) {
       if (!created.user) throw new TypeError("UserStore must return the created user");
+      assertUserIdentity(created.user);
       if (options.emailVerification) {
         await issueActionToken(
           "email-verification",
           created.user.id,
-          created.user.email,
+          requireEmail(created.user),
           options.emailVerification.tokens,
           options.emailVerification,
           defaultVerificationTokenTtl,
@@ -230,7 +307,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     const flow = options.emailVerification;
     if (!flow) return response({ error: "not_found" }, 404);
     const email = parseEmailRequest(await readJson(request, maxRequestBytes));
-    const limited = await rateLimit("email-verification", email, request);
+    const limited = await rateLimit("email-verification", { type: "email", value: email }, request);
     if (limited) return limited;
     if (!(await passPolicies(email, request))) return response({ status: "accepted" }, 202);
 
@@ -239,7 +316,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
       await issueActionToken(
         "email-verification",
         user.id,
-        user.email,
+        requireEmail(user),
         flow.tokens,
         flow,
         defaultVerificationTokenTtl,
@@ -269,7 +346,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     const flow = options.passwordReset;
     if (!flow) return response({ error: "not_found" }, 404);
     const email = parseEmailRequest(await readJson(request, maxRequestBytes));
-    const limited = await rateLimit("password-reset", email, request);
+    const limited = await rateLimit("password-reset", { type: "email", value: email }, request);
     if (limited) return limited;
     if (!(await passPolicies(email, request))) return response({ status: "accepted" }, 202);
 
@@ -278,7 +355,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
       await issueActionToken(
         "password-reset",
         user.id,
-        user.email,
+        requireEmail(user),
         flow.tokens,
         flow,
         defaultResetTokenTtl,
@@ -292,6 +369,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     const flow = options.passwordReset;
     if (!flow) return response({ error: "not_found" }, 404);
     const { token, password } = parsePasswordReset(await readJson(request, maxRequestBytes));
+    requirePasswordPolicy(password);
     const consumed = await flow.tokens.consume({
       purpose: "password-reset",
       tokenHash: await hashSessionToken(token),
@@ -307,6 +385,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
   }
 
   async function createSessionForUser(user: User): Promise<Response> {
+    assertUserIdentity(user);
     const token = createSessionToken();
     const tokenHash = await hashSessionToken(token);
     const now = Date.now();
@@ -327,11 +406,10 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     try {
       if (!hostIsAllowed(request)) return response({ error: "invalid_host" }, 403);
       const user = await options.users.findById(userId);
-      if (
-        !user ||
-        (options.emailVerification && !options.emailVerification.isVerified(user)) ||
-        !(await passPolicies(user.email, request))
-      ) {
+      if (!user) return response({ error: "unauthenticated" }, 401);
+      assertUserIdentity(user);
+      if ((options.emailVerification && !options.emailVerification.isVerified(user)) ||
+          !(await passPolicies(user.email, request))) {
         return response({ error: "unauthenticated" }, 401);
       }
       return await createSessionForUser(user);
@@ -342,14 +420,16 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
   }
 
   async function login(request: Request): Promise<Response> {
-    const { email, password } = parseCredentials(await readJson(request, maxRequestBytes));
-    const limited = await rateLimit("login", email, request);
+    const { identifier, password } = parseLoginCredentials(await readJson(request, maxRequestBytes), loginMode);
+    const limited = await rateLimit("login", identifier, request);
     if (limited) return limited;
-    if (!(await passPolicies(email, request))) return response({ error: "invalid_credentials" }, 401);
 
-    const user = await options.users.findByEmail(email);
-    const verified = await options.credentials.verify({ email, password, user });
-    if (!user || !verified || (options.emailVerification && !options.emailVerification.isVerified(user))) {
+    const user = await options.users.findByIdentifier(identifier);
+    const verified = await options.credentials.verify({ identifier, password, user });
+    if (user) assertUserIdentity(user);
+    const policyAllowed = await passPolicies(identifier.type === "email" ? identifier.value : user?.email, request);
+    if (!user || !verified || !policyAllowed ||
+        (options.emailVerification && !options.emailVerification.isVerified(user))) {
       return response({ error: "invalid_credentials" }, 401);
     }
 

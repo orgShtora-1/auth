@@ -1,21 +1,39 @@
 export interface AuthUser {
   readonly id: string;
-  readonly email: string;
+  readonly email?: string;
+  readonly username?: string;
+}
+
+export type AuthIdentifier =
+  | { readonly type: "email"; readonly value: string }
+  | { readonly type: "username"; readonly value: string };
+
+export type RegistrationIdentityMode = "email" | "username" | "both" | "either";
+export type LoginIdentityMode = "email" | "username" | "either";
+
+export interface PasswordPolicy {
+  minLength?: number;
+  maxLength?: number;
+  requireUppercase?: boolean;
+  requireLowercase?: boolean;
+  requireSpecial?: boolean;
 }
 
 export interface UserStore<User extends AuthUser = AuthUser> {
+  findByIdentifier(identifier: AuthIdentifier): Promise<User | null>;
   findByEmail(email: string): Promise<User | null>;
   findById(id: string): Promise<User | null>;
-  /** Enforce normalized-email uniqueness atomically; hash the password before persistence. */
+  /** Enforce canonical email/username uniqueness atomically; hash the password before persistence. */
   create(input: {
-    email: string;
+    email?: string;
+    username?: string;
     password: string;
   }): Promise<{ created: true; user: User } | { created: false }>;
 }
 
 export interface CredentialVerifier<User extends AuthUser = AuthUser> {
   verify(input: {
-    email: string;
+    identifier: AuthIdentifier;
     password: string;
     user: User | null;
   }): Promise<boolean>;
@@ -61,6 +79,11 @@ export interface AuthOptions<User extends AuthUser = AuthUser> {
   users: UserStore<User>;
   credentials: CredentialVerifier<User>;
   sessions: SessionStore;
+  identity?: {
+    registration?: RegistrationIdentityMode;
+    login?: LoginIdentityMode;
+  };
+  passwordPolicy?: PasswordPolicy;
   emailPolicy?: AccessPolicy;
   resolveClientIp?: (request: Request) => string | null | Promise<string | null>;
   ipPolicy?: AccessPolicy;
@@ -93,13 +116,14 @@ export interface SessionStore extends ExpiredRecordStore {
 export interface AuthRateLimiter {
   check(input: {
     action: "register" | "login" | "email-verification" | "password-reset";
-    email: string;
+    identifier: AuthIdentifier;
     ip: string;
   }): Promise<{
     allowed: boolean;
     retryAfterSeconds?: number;
   }>;
 }
+
 
 export type AuthRequestRateLimitAction =
   | "oidc-start"
@@ -126,7 +150,8 @@ export interface AccessPolicy {
 
 export interface AuthenticatedUser {
   readonly id: string;
-  readonly email: string;
+  readonly email?: string;
+  readonly username?: string;
 }
 
 export interface AuthApi {

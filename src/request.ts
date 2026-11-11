@@ -80,18 +80,64 @@ export function parseActionToken(value: unknown): string {
   return value;
 }
 
-export function parseCredentials(value: unknown): { email: string; password: string } {
-  const { email, password } = objectFields(value);
-  if (typeof password !== "string" || password.length === 0 || password.length > 4096) {
+function parsePassword(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) throw new RequestError(400, "invalid_request");
+  let codePoints = 0;
+  for (const _character of value) {
+    codePoints += 1;
+    if (codePoints > 4096) throw new RequestError(400, "invalid_request");
+  }
+  return value;
+}
+
+function parseUsername(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9._-]{3,32}$/.test(value)) {
     throw new RequestError(400, "invalid_request");
   }
-  return { email: parseEmail(email), password };
+  return value.toLowerCase();
+}
+
+export function parseRegistrationCredentials(
+  value: unknown,
+  mode: "email" | "username" | "both" | "either",
+): { email?: string; username?: string; password: string } {
+  const fields = objectFields(value);
+  const password = parsePassword(fields.password);
+  const hasEmail = fields.email !== undefined;
+  const hasUsername = fields.username !== undefined;
+  if ((mode === "email" && (hasUsername || !hasEmail)) ||
+      (mode === "username" && (hasEmail || !hasUsername)) ||
+      (mode === "both" && (!hasEmail || !hasUsername)) ||
+      (mode === "either" && hasEmail === hasUsername)) {
+    throw new RequestError(400, "invalid_request");
+  }
+  const email = hasEmail ? parseEmail(fields.email) : undefined;
+  const username = hasUsername ? parseUsername(fields.username) : undefined;
+  return { ...(email === undefined ? {} : { email }), ...(username === undefined ? {} : { username }), password };
+}
+
+export function parseLoginCredentials(
+  value: unknown,
+  mode: "email" | "username" | "either",
+): { identifier: { type: "email" | "username"; value: string }; password: string } {
+  const fields = objectFields(value);
+  const password = parsePassword(fields.password);
+  const hasEmail = fields.email !== undefined;
+  const hasUsername = fields.username !== undefined;
+  if ((mode === "email" && (hasUsername || !hasEmail)) ||
+      (mode === "username" && (hasEmail || !hasUsername)) ||
+      (mode === "either" && hasEmail === hasUsername)) {
+    throw new RequestError(400, "invalid_request");
+  }
+  return {
+    identifier: hasEmail
+      ? { type: "email", value: parseEmail(fields.email) }
+      : { type: "username", value: parseUsername(fields.username) },
+    password,
+  };
 }
 
 export function parsePasswordReset(value: unknown): { token: string; password: string } {
   const { token, password } = objectFields(value);
-  if (typeof password !== "string" || password.length === 0 || password.length > 4096) {
-    throw new RequestError(400, "invalid_request");
-  }
-  return { token: parseActionToken(token), password };
+  return { token: parseActionToken(token), password: parsePassword(password) };
 }

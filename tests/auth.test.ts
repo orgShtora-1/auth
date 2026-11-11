@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createAuth, type AuthApi, type AuthOptions, type AuthUser, type SessionStore, type StoredSession, type UserStore } from "../src/index.js";
+import { createAuth, type AuthApi, type AuthIdentifier, type AuthOptions, type AuthUser, type SessionStore, type StoredSession, type UserStore } from "../src/index.js";
 
-type TestUser = AuthUser;
+interface TestUser extends AuthUser {
+  readonly passwordHash?: string;
+  readonly role?: string;
+}
 
 const origin = "https://app.example.test";
 const credentialsBody = (email = "person@example.test", password = "Valid-password-123"): string =>
@@ -9,22 +12,33 @@ const credentialsBody = (email = "person@example.test", password = "Valid-passwo
 
 function setup(overrides: Partial<AuthOptions<TestUser>> = {}) {
   const byEmail = new Map<string, TestUser>();
+  const byUsername = new Map<string, TestUser>();
   const byId = new Map<string, TestUser>();
   const sessions = new Map<string, StoredSession>();
-  const verifierInputs: Array<{ email: string; password: string; user: TestUser | null }> = [];
+  const verifierInputs: Array<{ identifier: AuthIdentifier; password: string; user: TestUser | null }> = [];
   let allowedPassword = "Valid-password-123";
 
   const users: UserStore<TestUser> = {
+    async findByIdentifier({ type, value }) {
+      return (type === "email" ? byEmail : byUsername).get(value) ?? null;
+    },
     async findByEmail(email) {
       return byEmail.get(email) ?? null;
     },
     async findById(id) {
       return byId.get(id) ?? null;
     },
-    async create({ email }) {
-      if (byEmail.has(email)) return { created: false };
-      const user = { id: `user-${byEmail.size + 1}`, email };
-      byEmail.set(email, user);
+    async create({ email, username }) {
+      if ((email && byEmail.has(email)) || (username && byUsername.has(username))) return { created: false };
+      const user: TestUser = {
+        id: `user-${byId.size + 1}`,
+        ...(email === undefined ? {} : { email }),
+        ...(username === undefined ? {} : { username }),
+        passwordHash: "not-a-real-hash",
+        role: "admin",
+      };
+      if (email) byEmail.set(email, user);
+      if (username) byUsername.set(username, user);
       byId.set(user.id, user);
       return { created: true, user };
     },
@@ -77,8 +91,11 @@ function setup(overrides: Partial<AuthOptions<TestUser>> = {}) {
   return {
     auth,
     byEmail,
+    byUsername,
+    byId,
     sessions,
     verifierInputs,
+    setAllowedPassword(password: string) { allowedPassword = password; },
   };
 }
 
@@ -162,6 +179,227 @@ describe("@shtora/auth", () => {
     expect(verifierInputs.some((input) => input.user === null)).toBe(true);
     expect((await auth.handle(request("/api/auth/session"))).status).toBe(401);
   });
+  test("normalizes usernames and supports exactly one configured login identifier", async () => {
+    const { auth, byUsername } = setup({
+      identity: { registration: "username", login: "username" },
+    });
+    const registered = await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "Alice_1", password: "Valid-password-123", ignored: "field" }),
+    }));
+    expect(registered.status).toBe(202);
+    expect(byUsername.has("alice_1")).toBe(true);
+    const duplicate = await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "ALICE_1", password: "Valid-password-123" }),
+    }));
+    expect(duplicate.status).toBe(202);
+    expect(byUsername.size).toBe(1);
+
+    const signedIn = await auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: "ALICE_1", password: "Valid-password-123" }),
+    }));
+    expect(signedIn.status).toBe(200);
+    expect(await signedIn.json()).toEqual({ user: { id: "user-1", username: "alice_1" } });
+
+    const ambiguous = await auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: "alice_1", email: "person@example.test", password: "Valid-password-123" }),
+    }));
+    expect(ambiguous.status).toBe(400);
+  });
+
+  test("enforces both-required and either-one registration shapes", async () => {
+    const both = setup({ identity: { registration: "both", login: "either" } });
+    expect((await both.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", password: "Valid-password-123" }),
+    }))).status).toBe(400);
+    expect((await both.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", username: "Alice", password: "Valid-password-123" }),
+    }))).status).toBe(202);
+    expect((await both.auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", password: "Valid-password-123" }),
+    }))).status).toBe(200);
+    expect((await both.auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: "alice", password: "Valid-password-123" }),
+    }))).status).toBe(200);
+
+    const either = setup({ identity: { registration: "either", login: "either" } });
+    expect((await either.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ password: "Valid-password-123" }),
+    }))).status).toBe(400);
+    expect((await either.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", username: "Alice", password: "Valid-password-123" }),
+    }))).status).toBe(400);
+    expect((await either.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "Alice", password: "Valid-password-123" }),
+    }))).status).toBe(202);
+  });
+  test("rejects identity mode pairs that strand registered accounts", () => {
+    for (const identity of [
+      { registration: "email", login: "username" },
+      { registration: "username", login: "email" },
+      { registration: "either", login: "email" },
+      { registration: "either", login: "username" },
+    ] as const) {
+      expect(() => setup({ identity })).toThrow("identity login mode is incompatible with registration mode");
+    }
+
+    for (const identity of [
+      { registration: "email", login: "email" },
+      { registration: "username", login: "username" },
+      { registration: "either", login: "either" },
+      { registration: "both", login: "email" },
+      { registration: "both", login: "username" },
+      { registration: "both", login: "either" },
+    ] as const) {
+      expect(() => setup({ identity })).not.toThrow();
+    }
+  });
+  test("username-only login accepts only the username field and rejects email-like usernames", async () => {
+    const { auth } = setup({ identity: { registration: "username", login: "username" } });
+    const invalidUsername = await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "person@example.test", password: "Valid-password-123" }),
+    }));
+    expect(invalidUsername.status).toBe(400);
+    await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "alice", password: "Valid-password-123" }),
+    }));
+    expect((await auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: "alice@example.test", password: "Valid-password-123" }),
+    }))).status).toBe(400);
+    expect((await auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: "alice", password: "Valid-password-123" }),
+    }))).status).toBe(200);
+  });
+  test("fails closed and reports adapter users missing configured identity fields", async () => {
+    const observed: string[] = [];
+    const state = setup({
+      identity: { registration: "both" },
+      onError({ operation }) { observed.push(operation); },
+    });
+    await state.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", username: "alice", password: "Valid-password-123" }),
+    }));
+    state.byId.set("user-1", { id: "user-1", email: "person@example.test" });
+
+    await expect(state.auth.createSessionResponse(request("/api/auth/login"), "user-1")).rejects.toThrow(
+      "UserStore returned an invalid user identity",
+    );
+    expect(observed).toContain("createSessionResponse");
+    expect(state.sessions.size).toBe(0);
+  });
+
+  test("applies configurable password rules on registration without adding a digit rule", async () => {
+    const { auth, byEmail } = setup({
+      passwordPolicy: { minLength: 3, maxLength: 3, requireUppercase: true, requireLowercase: true, requireSpecial: true },
+    });
+    const invalid = await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", password: "ABC" }),
+    }));
+    expect(invalid.status).toBe(400);
+    expect(byEmail.size).toBe(0);
+    const valid = await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", password: "aA!" }),
+    }));
+    expect(valid.status).toBe(202);
+    expect(byEmail.size).toBe(1);
+  });
+  test("enforces exact minimum and maximum password policy boundaries", async () => {
+    const { auth, byEmail } = setup({ passwordPolicy: { minLength: 2, maxLength: 3 } });
+    const registerWith = (email: string, password: string) => auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }));
+
+    expect((await registerWith("short@example.test", "x")).status).toBe(400);
+    expect((await registerWith("min@example.test", "ab")).status).toBe(202);
+    expect((await registerWith("max@example.test", "abc")).status).toBe(202);
+    expect((await registerWith("long@example.test", "abcd")).status).toBe(400);
+    expect(byEmail.size).toBe(2);
+  });
+  test("counts password code points and caps them independently of request bytes", async () => {
+    const unicode = setup({
+      maxRequestBytes: 32_768,
+      passwordPolicy: { minLength: 2, maxLength: 2 },
+    });
+    const accepted = await unicode.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", password: "😀a" }),
+    }));
+    expect(accepted.status).toBe(202);
+
+    const overHardCap = setup({ maxRequestBytes: 32_768 });
+    const rejected = await overHardCap.auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email: "person@example.test", password: "x".repeat(4097) }),
+    }));
+    expect(rejected.status).toBe(400);
+    expect(overHardCap.byEmail.size).toBe(0);
+  });
+
+  test("email policy denies email-less accounts without blocking the verifier path", async () => {
+    const { auth, verifierInputs, byId, byUsername } = setup({
+      identity: { registration: "username", login: "username" },
+      emailPolicy: { async allow() { return true; } },
+    });
+    const registration = await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "alice", password: "Valid-password-123" }),
+    }));
+    expect(registration.status).toBe(202);
+    expect(byId.size).toBe(0);
+    const legacyUser = { id: "user-1", username: "alice" };
+    byId.set(legacyUser.id, legacyUser);
+    byUsername.set(legacyUser.username, legacyUser);
+    const loginResponse = await auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: "alice", password: "Valid-password-123" }),
+    }));
+    expect(loginResponse.status).toBe(401);
+    expect(verifierInputs.at(-1)?.user).not.toBeNull();
+    expect((await auth.createSessionResponse(request("/api/auth/login"), "user-1")).status).toBe(401);
+  });
+
+  test("does not apply password policy to login", async () => {
+    const { auth, setAllowedPassword } = setup({ passwordPolicy: { requireSpecial: true } });
+    await register(auth);
+    setAllowedPassword("legacy-password");
+    const response = await auth.handle(request("/api/auth/login", {
+      method: "POST",
+      body: credentialsBody("person@example.test", "legacy-password"),
+    }));
+    expect(response.status).toBe(200);
+  });
+
+  test("rate limits by typed canonical identifier", async () => {
+    const checked: AuthIdentifier[] = [];
+    const { auth } = setup({
+      identity: { registration: "username", login: "username" },
+      resolveClientIp: () => "192.0.2.1",
+      rateLimiter: { async check({ identifier }) { checked.push(identifier); return { allowed: true }; } },
+    });
+    await auth.handle(request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username: "Alice", password: "Valid-password-123" }),
+    }));
+    expect(checked).toEqual([{ type: "username", value: "alice" }]);
+  });
 
   test("stores only a SHA-256 token digest and authenticates via the secure cookie", async () => {
     const { auth, sessions } = setup();
@@ -179,15 +417,19 @@ describe("@shtora/auth", () => {
     expect(token).toBeDefined();
     expect(sessions.size).toBe(1);
     expect([...sessions.keys()][0]).not.toBe(token);
-    expect(await response.json()).toEqual({ user: { id: "user-1", email: "person@example.test" } });
+    const loginBody = await response.json() as { user: Record<string, unknown> };
+    expect(loginBody).toEqual({ user: { id: "user-1", email: "person@example.test" } });
+    expect(loginBody.user).not.toHaveProperty("passwordHash");
+    expect(loginBody.user).not.toHaveProperty("role");
 
     const sessionResponse = await auth.handle(
       request("/api/auth/session", { headers: { Cookie: `__Host-shtora.session=${token}` } }),
     );
     expect(sessionResponse.status).toBe(200);
-    expect(await sessionResponse.json()).toEqual({
-      user: { id: "user-1", email: "person@example.test" },
-    });
+    const sessionBody = await sessionResponse.json() as { user: Record<string, unknown> };
+    expect(sessionBody).toEqual({ user: { id: "user-1", email: "person@example.test" } });
+    expect(sessionBody.user).not.toHaveProperty("passwordHash");
+    expect(sessionBody.user).not.toHaveProperty("role");
   });
 
   test("revokes sessions on logout and clears the matching cookie", async () => {

@@ -1,5 +1,6 @@
 import type {
   AuthActionTokenStore,
+  AuthIdentifier,
   AuthRateLimiter,
   AuthRequestRateLimitAction,
   AuthRequestRateLimiter,
@@ -121,7 +122,7 @@ export interface D1RateLimitWindow {
 }
 
 export interface D1RateLimiterOptions {
-  email: D1RateLimitWindow;
+  identifier: D1RateLimitWindow;
   ip: D1RateLimitWindow;
   /** Epoch milliseconds; injectable to make window boundaries deterministic in tests. */
   now?: () => number;
@@ -133,14 +134,14 @@ interface CounterRow {
 }
 
 export function createD1RateLimiter(db: D1Database, options: D1RateLimiterOptions): AuthRateLimiter {
-  validateWindow("email", options.email);
+  validateWindow("identifier", options.identifier);
   validateWindow("ip", options.ip);
   const now = options.now ?? Date.now;
 
   return {
-    async check({ action, email, ip }) {
+    async check({ action, identifier, ip }: { action: string; identifier: AuthIdentifier; ip: string }) {
       const dimensions = [
-        { name: "email", raw: email, config: options.email },
+        { name: `identifier:${identifier.type}`, raw: identifier.value, config: options.identifier },
         { name: "ip", raw: ip, config: options.ip },
       ] as const;
       const digests = await Promise.all(dimensions.map(({ name, raw }) => hashKey(`${action}\0${name}\0${raw}`)));
