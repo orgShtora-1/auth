@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a concrete capability for package users.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What task or limitation affects your application?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the API or observable behavior you need.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include existing workarounds, if any.
+    validations:
+      required: false
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime or integration
+      options:
+        - Next.js
+        - Cloudflare Workers
+        - Runtime-neutral core
+        - Other
+    validations:
+      required: true

@@ -1,0 +1,66 @@
+{
+  "name": "@shtora/auth",
+  "description": "Framework-neutral auth handlers and session management for Next.js and Cloudflare Workers, with optional D1, OIDC, and WebAuthn adapters.",
+  "keywords": [
+    "authentication",
+    "auth",
+    "nextjs",
+    "next.js",
+    "cloudflare-workers",
+    "cloudflare-d1",
+    "workers",
+    "session-management",
+    "sessions",
+    "typescript",
+    "edge-runtime",
+    "oidc",
+    "openid-connect",
+    "webauthn",
+    "passkeys",
+    "email-verification",
+    "password-reset"
+  ],
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./cloudflare": {
+      "types": "./dist/cloudflare.d.ts",
+      "import": "./dist/cloudflare.js"
+    },
+    "./oidc": {
+      "types": "./dist/oidc.d.ts",
+      "import": "./dist/oidc.js"
+    },
+    "./webauthn": {
+      "types": "./dist/webauthn.d.ts",
+      "import": "./dist/webauthn.js"
+    }
+  },
+  "publishConfig": { "access": "public" },
+  "peerDependencies": {
+    "@simplewebauthn/server": ">=14.0.3 <15",
+    "openid-client": ">=6 <7"
+  },
+  "peerDependenciesMeta": {
+    "@simplewebauthn/server": { "optional": true },
+    "openid-client": { "optional": true }
+  },
+  "files": ["dist", "migrations"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@simplewebauthn/server": "^14.0.3",
+    "@types/bun": "latest",
+    "openid-client": "^6.8.1",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,21 @@
+export { createAuth } from "./auth.js";
+export type {
+  AccessPolicy,
+  AuthActionTokenDelivery,
+  AuthActionTokenPurpose,
+  AuthActionTokenStore,
+  AuthApi,
+  AuthenticatedUser,
+  AuthOptions,
+  AuthRateLimiter,
+  AuthRequestRateLimitAction,
+  AuthRequestRateLimiter,
+  AuthUser,
+  CredentialVerifier,
+  EmailVerificationOptions,
+  ExpiredRecordStore,
+  PasswordResetOptions,
+  SessionStore,
+  StoredSession,
+  UserStore,
+} from "./types.js";
