@@ -11,8 +11,16 @@ Your application owns its user records, credential verification, password hashin
 Install the published package from npm:
 
 ```sh
-bun add @shtora/auth
+bun add @shtora/auth@latest
 ```
+
+To install a beta release:
+
+```sh
+bun add @shtora/auth@beta
+```
+
+The `beta` tag must point to a published beta version. It is not currently available.
 
 Install optional protocol dependencies only when you use those entry points:
 
