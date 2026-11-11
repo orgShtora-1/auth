@@ -1,10 +1,14 @@
 # @shtora/auth
 
+[Repository](https://github.com/orgShtora-1/auth) · [Issues](https://github.com/orgShtora-1/auth/issues) · [Contributing](https://github.com/orgShtora-1/auth/blob/main/CONTRIBUTING.md)
+
 Framework-neutral authentication handlers and session management for Next.js and Cloudflare Workers. The core uses standard `Request`/`Response` APIs and Web Crypto; optional entry points add Cloudflare D1, OIDC, and WebAuthn support.
 
 Your application owns its user records, credential verification, password hashing, email delivery, and persistent stores. The package does not hash, encrypt, or persist passwords and includes no ORM.
 
 ## Install
+
+`@shtora/auth` is not currently available through the public npm registry. After a public release, install it with:
 
 ```sh
 bun add @shtora/auth
