@@ -127,6 +127,18 @@ async function login(auth: AuthApi, email = "person@example.test") {
 }
 
 describe("@shtora/auth", () => {
+  test("rejects passwords shorter than 15 characters by default", async () => {
+    const { auth } = setup();
+    const response = await auth.handle(
+      request("/api/auth/register", {
+        method: "POST",
+        body: credentialsBody("short@example.test", "too-short"),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "invalid_request" });
+  });
   test("registers normalized email without returning or storing credentials", async () => {
     const { auth, byEmail } = setup();
     const response = await auth.handle(
@@ -430,6 +442,23 @@ describe("@shtora/auth", () => {
     expect(sessionBody).toEqual({ user: { id: "user-1", email: "person@example.test" } });
     expect(sessionBody.user).not.toHaveProperty("passwordHash");
     expect(sessionBody.user).not.toHaveProperty("role");
+  });
+  test("exposes authenticated session timestamps for step-up checks", async () => {
+    const { auth, sessions } = setup();
+    await register(auth);
+    const response = await login(auth);
+    const token = response.headers.get("set-cookie")?.match(/=([a-f0-9]{64})/)?.[1] as string;
+    const stored = [...sessions.values()][0]!;
+
+    const session = await auth.getSessionDetails(
+      request("/api/auth/session", { headers: { Cookie: `__Host-shtora.session=${token}` } }),
+    );
+
+    expect(session).toEqual({
+      user: { id: "user-1", email: "person@example.test" },
+      createdAtMs: stored.createdAtMs,
+      expiresAtMs: stored.expiresAtMs,
+    });
   });
 
   test("revokes sessions on logout and clears the matching cookie", async () => {

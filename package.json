@@ -1,14 +1,11 @@
 {
   "name": "@shtora/auth",
-  "description": "Framework-neutral auth handlers and session management for Next.js and Cloudflare Workers, with optional D1, OIDC, and WebAuthn adapters.",
+  "description": "Framework-neutral auth handlers and session management for Next.js, with optional OIDC and WebAuthn adapters.",
   "keywords": [
     "authentication",
     "auth",
     "nextjs",
     "next.js",
-    "cloudflare-workers",
-    "cloudflare-d1",
-    "workers",
     "session-management",
     "sessions",
     "typescript",
@@ -26,10 +23,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    },
-    "./cloudflare": {
-      "types": "./dist/cloudflare.d.ts",
-      "import": "./dist/cloudflare.js"
     },
     "./oidc": {
       "types": "./dist/oidc.d.ts",

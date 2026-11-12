@@ -29,7 +29,6 @@ body:
       label: Runtime or integration
       options:
         - Next.js
-        - Cloudflare Workers
         - Runtime-neutral core
         - Other
     validations:

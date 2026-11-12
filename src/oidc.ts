@@ -37,7 +37,9 @@ export interface OidcConfig<User extends AuthUser> {
   readonly onError?: (input: { operation: "start" | "callback" | "cleanup"; error: unknown }) => void | Promise<void>;
 }
 
-const cookieName = "__Host-shtora.oidc-state";
+const cookiePrefix = "__Host-shtora.oidc-state-";
+const stateCookieName = (state: string): string | null =>
+  /^[A-Za-z0-9_-]{1,128}$/.test(state) ? `${cookiePrefix}${state}` : null;
 const defaultTtlSeconds = 600;
 
 /** Creates a Web-Request handler for GET /start and GET /callback. */
@@ -66,15 +68,16 @@ export function createOidc<User extends AuthUser>(options: OidcConfig<User>): Oi
       throw error;
     }
   };
-  const cookie = (state: string, maxAge: number): string =>
-    `${cookieName}=${state}; Path=/; Max-Age=${maxAge}; Secure; HttpOnly; SameSite=Lax`;
-  const clearCookie = `${cookieName}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax`;
-  const readStateCookie = (request: Request): string | null => {
+  const cookie = (name: string, state: string, maxAge: number): string =>
+    `${name}=${state}; Path=/; Max-Age=${maxAge}; Secure; HttpOnly; SameSite=Lax`;
+  const clearCookie = (name: string): string =>
+    `${name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax`;
+  const readStateCookie = (request: Request, name: string): string | null => {
     let found: string | null = null;
     for (const value of (request.headers.get("cookie") ?? "").split(";")) {
       const pair = value.trim();
       const equals = pair.indexOf("=");
-      if (equals < 0 || pair.slice(0, equals) !== cookieName) continue;
+      if (equals < 0 || pair.slice(0, equals) !== name) continue;
       if (found !== null) return null;
       found = pair.slice(equals + 1);
     }
@@ -135,15 +138,15 @@ export function createOidc<User extends AuthUser>(options: OidcConfig<User>): Oi
     const current = new URL(request.url);
     if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET", "Cache-Control": "no-store" } });
     if (current.pathname === new URL(options.callbackUrl).pathname) {
-      const headers = new Headers({ "Cache-Control": "no-store", "Set-Cookie": clearCookie });
+      let headers = new Headers({ "Cache-Control": "no-store" });
       try {
+        const callbackRequest = callbackRequestUrl(request);
+        const state = callbackRequest?.searchParams.get("state");
+        const name = state ? stateCookieName(state) : null;
+        if (name) headers = new Headers({ "Cache-Control": "no-store", "Set-Cookie": clearCookie(name) });
         const limited = await rateLimited("oidc-callback", request, headers);
         if (limited) return limited;
-        const callbackRequest = callbackRequestUrl(request);
-        if (!callbackRequest) return failure(headers);
-        const state = callbackRequest.searchParams.get("state");
-        const browserState = readStateCookie(request);
-        if (!state || !browserState || state !== browserState) return failure(headers);
+        if (!callbackRequest || !state || !name || readStateCookie(request, name) !== state) return failure(headers);
         const transaction = await options.transactions.consume({ state, nowMs: Date.now() });
         if (!transaction || transaction.state !== state || transaction.expiresAtMs <= Date.now()) return failure(headers);
         const client = await getConfig();
@@ -167,7 +170,7 @@ export function createOidc<User extends AuthUser>(options: OidcConfig<User>): Oi
           return failure(headers, sessionResponse.status >= 500 ? 500 : 400);
         }
         const responseHeaders = new Headers(sessionResponse.headers);
-        responseHeaders.append("Set-Cookie", clearCookie);
+        responseHeaders.append("Set-Cookie", clearCookie(name));
         responseHeaders.set("Location", new URL(options.successPath, callbackUrl.origin).href);
         responseHeaders.set("Cache-Control", "no-store");
         return new Response(null, { status: 303, headers: responseHeaders });
@@ -184,6 +187,8 @@ export function createOidc<User extends AuthUser>(options: OidcConfig<User>): Oi
       const limited = await rateLimited("oidc-start", request);
       if (limited) return limited;
       const state = oidc.randomState();
+      const name = stateCookieName(state);
+      if (!name) throw new TypeError("OIDC state cannot be used as a cookie selector");
       const nonce = oidc.randomNonce();
       const codeVerifier = oidc.randomPKCECodeVerifier();
       const codeChallenge = await oidc.calculatePKCECodeChallenge(codeVerifier);
@@ -199,7 +204,7 @@ export function createOidc<User extends AuthUser>(options: OidcConfig<User>): Oi
       });
       return new Response(null, { status: 302, headers: {
         Location: destination.href,
-        "Set-Cookie": cookie(state, ttl),
+        "Set-Cookie": cookie(name, state, ttl),
         "Cache-Control": "no-store",
         "Referrer-Policy": "no-referrer",
       } });

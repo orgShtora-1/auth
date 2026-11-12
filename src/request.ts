@@ -52,7 +52,7 @@ export async function readJson(request: Request, maxBytes: number): Promise<unkn
   }
 }
 
-function objectFields(value: unknown): Record<string, unknown> {
+export function objectFields(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new RequestError(400, "invalid_request");
   }
@@ -66,6 +66,32 @@ export function parseEmailRequest(value: unknown): string {
 export function parseActionTokenRequest(value: unknown): string {
   return parseActionToken(objectFields(value).token);
 }
+
+export function parseTotpVerifyRequest(value: unknown): { challengeToken: string; code: string } {
+  const fields = objectFields(value);
+  const code = fields.code;
+  if (typeof code !== "string") throw new RequestError(400, "invalid_request");
+  const normalized = code.toUpperCase().replace(/[ -]/g, "");
+  if (!/^[0-9]{6,8}$/.test(normalized) && !/^[A-Z2-7]{10}$/.test(normalized)) {
+    throw new RequestError(400, "invalid_request");
+  }
+  return { challengeToken: parseActionToken(fields.challengeToken), code };
+}
+
+export function parseOtpCode(value: unknown): string {
+  if (typeof value !== "string" || !/^[0-9]{6,8}$/.test(value)) {
+    throw new RequestError(400, "invalid_request");
+  }
+  return value;
+}
+
+export function parseRecoveryCode(value: unknown): string {
+  if (typeof value !== "string") throw new RequestError(400, "invalid_request");
+  const normalized = value.toUpperCase().replace(/[ -]/g, "");
+  if (!/^[A-Z2-7]{10}$/.test(normalized)) throw new RequestError(400, "invalid_request");
+  return normalized;
+}
+
 export function parseEmail(value: unknown): string {
   if (typeof value !== "string" || value.length > 254 || !value.includes("@") || /\s/.test(value)) {
     throw new RequestError(400, "invalid_request");

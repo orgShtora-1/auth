@@ -1,12 +1,15 @@
 import { clearedSessionCookie, readSessionToken, sessionCookie } from "./cookies.js";
 import { createSessionToken, hashSessionToken } from "./crypto.js";
-import { parseActionTokenRequest, parseEmailRequest, parseLoginCredentials, parsePasswordReset, parseRegistrationCredentials, readJson, RequestError } from "./request.js";
+import { objectFields, parseActionTokenRequest, parseEmailRequest, parseLoginCredentials, parseOtpCode, parsePasswordReset, parseRegistrationCredentials, parseTotpVerifyRequest, readJson, RequestError } from "./request.js";
+import { createOtpauthUri, createRecoveryCodes, createTotpSecret, normalizeRecoveryCode, verifyTotp } from "./totp.js";
 import type {
   AccessPolicy,
   AuthActionTokenPurpose,
   AuthActionTokenStore,
   AuthApi,
   AuthIdentifier,
+  TotpRecord,
+  AuthenticatedSession,
   AuthenticatedUser,
   AuthOptions,
   AuthUser,
@@ -24,8 +27,14 @@ const defaultMaxRequestBytes = 8192;
 const defaultVerificationTokenTtl = 60 * 60;
 const defaultResetTokenTtl = 15 * 60;
 const maxActionTokenTtl = 60 * 60 * 24;
+const defaultChallengeTtlSeconds = 300;
+const defaultMagicLinkTtlSeconds = 900;
+const defaultTotpDigits = 6;
+const defaultTotpPeriodSeconds = 30;
+const defaultTotpSkew = 1;
+const defaultRecoveryCodeCount = 10;
 
-const defaultPasswordPolicy = { minLength: 1, maxLength: 4096 };
+const defaultPasswordPolicy = { minLength: 15, maxLength: 4096 };
 const hardMaxPasswordLength = 4096;
 export function createAuth<User extends AuthUser>(options: AuthOptions<User>): AuthApi {
   const basePath = options.basePath ?? defaultBasePath;
@@ -76,11 +85,54 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
   if ((options.ipPolicy || options.rateLimiter) && !options.resolveClientIp) {
     throw new TypeError("resolveClientIp is required when ipPolicy or rateLimiter is configured");
   }
-  for (const ttl of [options.emailVerification?.tokenTtlSeconds, options.passwordReset?.tokenTtlSeconds]) {
+  for (const ttl of [options.emailVerification?.tokenTtlSeconds, options.passwordReset?.tokenTtlSeconds,
+    options.magicLink?.delivery.tokenTtlSeconds]) {
     if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 1 || ttl > maxActionTokenTtl)) {
       throw new RangeError("tokenTtlSeconds must be between 1 and 86400");
     }
   }
+  if (options.sessionIdleSeconds !== undefined &&
+      (!Number.isInteger(options.sessionIdleSeconds) || options.sessionIdleSeconds < 1)) {
+    throw new RangeError("sessionIdleSeconds must be a positive integer");
+  }
+  if (options.sessionIdleSeconds !== undefined && !options.sessions.refreshExpiry) {
+    throw new TypeError("sessions.refreshExpiry is required when sessionIdleSeconds is configured");
+  }
+  if (options.sessionRotationSeconds !== undefined &&
+      (!Number.isInteger(options.sessionRotationSeconds) || options.sessionRotationSeconds < 1)) {
+    throw new RangeError("sessionRotationSeconds must be a positive integer");
+  }
+  const totpOptions = options.totp && {
+    ...options.totp,
+    digits: options.totp.digits ?? defaultTotpDigits,
+    periodSeconds: options.totp.periodSeconds ?? defaultTotpPeriodSeconds,
+    skew: options.totp.skew ?? defaultTotpSkew,
+    recoveryCodeCount: options.totp.recoveryCodeCount ?? defaultRecoveryCodeCount,
+  };
+  if (totpOptions) {
+    if (typeof totpOptions.issuer !== "string" || totpOptions.issuer.length === 0) {
+      throw new TypeError("totp.issuer must be a non-empty string");
+    }
+    if (totpOptions.digits !== 6 && totpOptions.digits !== 8) throw new TypeError("totp.digits must be 6 or 8");
+    if (!Number.isInteger(totpOptions.periodSeconds) || totpOptions.periodSeconds < 1) {
+      throw new RangeError("totp.periodSeconds must be a positive integer");
+    }
+    if (!Number.isInteger(totpOptions.skew) || totpOptions.skew < 0 || totpOptions.skew > 10) {
+      throw new RangeError("totp.skew must be an integer between 0 and 10");
+    }
+    if (!Number.isInteger(totpOptions.recoveryCodeCount) || totpOptions.recoveryCodeCount < 1 ||
+        totpOptions.recoveryCodeCount > 100) {
+      throw new RangeError("totp.recoveryCodeCount must be an integer between 1 and 100");
+    }
+  }
+  const sessionIdleMs = options.sessionIdleSeconds !== undefined ? options.sessionIdleSeconds * 1000 : undefined;
+  const sessionRotationMs = options.sessionRotationSeconds !== undefined ? options.sessionRotationSeconds * 1000 : undefined;
+  async function requireUnblockedPassword(password: string, request: Request): Promise<void> {
+    if (options.passwordBlocklist && await options.passwordBlocklist({ password, request })) {
+      throw new RequestError(400, "invalid_request");
+    }
+  }
+
   function passwordAllowed(password: string): boolean {
     let length = 0;
     for (const _character of password) length += 1;
@@ -199,16 +251,25 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     };
   }
 
-  async function getSession(request: Request): Promise<AuthenticatedUser | null> {
+  async function getSessionDetails(request: Request): Promise<AuthenticatedSession | null> {
     try {
       const token = readSessionToken(request.headers.get("cookie"), cookieName);
       if (!token) return null;
       const tokenHash = await hashSessionToken(token);
-      const stored = await options.sessions.findByTokenHash(tokenHash);
+      let stored = await options.sessions.findByTokenHash(tokenHash);
       const now = Date.now();
-      if (!stored || stored.tokenHash !== tokenHash || !Number.isFinite(stored.expiresAtMs) || stored.expiresAtMs <= now) {
+      if (!stored || stored.tokenHash !== tokenHash ||
+          !Number.isFinite(stored.createdAtMs) || stored.createdAtMs > now ||
+          !Number.isFinite(stored.expiresAtMs) || stored.expiresAtMs <= now) {
         if (stored?.tokenHash === tokenHash) await options.sessions.deleteByTokenHash(tokenHash);
         return null;
+      }
+      if (sessionIdleMs !== undefined) {
+        const target = Math.min(now + sessionIdleMs, stored.createdAtMs + sessionTtlSeconds * 1000);
+        if (target > stored.expiresAtMs && options.sessions.refreshExpiry) {
+          await options.sessions.refreshExpiry({ tokenHash, expiresAtMs: target });
+          stored = { ...stored, expiresAtMs: target };
+        }
       }
 
       const user = await options.users.findById(stored.userId);
@@ -223,15 +284,52 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
         const ip = await clientIp(request);
         if (!ip || !(await isAllowed(options.ipPolicy, ip, request))) return null;
       }
-      return publicUser(user);
+      return {
+        user: publicUser(user),
+        createdAtMs: stored.createdAtMs,
+        expiresAtMs: stored.expiresAtMs,
+      };
     } catch (error) {
       if (!(error instanceof RequestError)) await report("getSession", error);
       throw error;
     }
   }
 
+  async function getSession(request: Request): Promise<AuthenticatedUser | null> {
+    return (await getSessionDetails(request))?.user ?? null;
+  }
+
+  async function resolveRotatedSession(request: Request): Promise<{ user: AuthenticatedUser; setCookie?: string } | null> {
+    const details = await getSessionDetails(request);
+    if (!details) return null;
+    if (sessionRotationMs === undefined) return { user: details.user };
+    const token = readSessionToken(request.headers.get("cookie"), cookieName);
+    if (!token) return { user: details.user };
+    const tokenHash = await hashSessionToken(token);
+    const current = await options.sessions.findByTokenHash(tokenHash);
+    if (!current) return { user: details.user };
+    const now = Date.now();
+    if (now - current.createdAtMs < sessionRotationMs) return { user: details.user };
+    const replacementToken = createSessionToken();
+    const replacement: StoredSession = {
+      id: createSessionToken(),
+      tokenHash: await hashSessionToken(replacementToken),
+      userId: current.userId,
+      createdAtMs: now,
+      expiresAtMs: Math.min(current.createdAtMs + sessionTtlSeconds * 1000,
+        now + (options.sessionIdleSeconds ?? sessionTtlSeconds) * 1000),
+    };
+    await options.sessions.create(replacement);
+    await options.sessions.deleteByTokenHash(tokenHash);
+    return {
+      user: details.user,
+      setCookie: sessionCookie(replacementToken, cookieName,
+        Math.max(1, Math.round((replacement.expiresAtMs - now) / 1000)), now),
+    };
+  }
+
   async function rateLimit(
-    action: "register" | "login" | "email-verification" | "password-reset",
+    action: "register" | "login" | "email-verification" | "password-reset" | "magic-link" | "totp",
     identifier: AuthIdentifier,
     request: Request,
   ): Promise<Response | null> {
@@ -278,6 +376,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
   async function register(request: Request): Promise<Response> {
     const credentials = parseRegistrationCredentials(await readJson(request, maxRequestBytes), registrationMode);
     requirePasswordPolicy(credentials.password);
+    await requireUnblockedPassword(credentials.password, request);
     const identifier: AuthIdentifier = credentials.email !== undefined
       ? { type: "email", value: credentials.email }
       : { type: "username", value: credentials.username! };
@@ -370,6 +469,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     if (!flow) return response({ error: "not_found" }, 404);
     const { token, password } = parsePasswordReset(await readJson(request, maxRequestBytes));
     requirePasswordPolicy(password);
+    await requireUnblockedPassword(password, request);
     const consumed = await flow.tokens.consume({
       purpose: "password-reset",
       tokenHash: await hashSessionToken(token),
@@ -394,7 +494,7 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
       tokenHash,
       userId: user.id,
       createdAtMs: now,
-      expiresAtMs: now + sessionTtlSeconds * 1000,
+      expiresAtMs: now + Math.min(sessionTtlSeconds, options.sessionIdleSeconds ?? sessionTtlSeconds) * 1000,
     };
     await options.sessions.create(session);
     return response({ user: publicUser(user) }, 200, {
@@ -432,7 +532,182 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
         (options.emailVerification && !options.emailVerification.isVerified(user))) {
       return response({ error: "invalid_credentials" }, 401);
     }
+    if (totpOptions) {
+      const record = await totpOptions.store.get(user.id);
+      if (record?.confirmed) {
+        const challengeToken = createSessionToken();
+        await totpOptions.challengeTokens.create({
+          purpose: "totp-challenge",
+          userId: user.id,
+          tokenHash: await hashSessionToken(challengeToken),
+          expiresAtMs: Date.now() + defaultChallengeTtlSeconds * 1000,
+        });
+        return response({ totpRequired: true, challengeToken }, 200);
+      }
+    }
+    return createSessionForUser(user);
+  }
 
+  async function userIdentifier(user: User): Promise<AuthIdentifier> {
+    return user.email !== undefined ? { type: "email", value: user.email } : { type: "username", value: user.username! };
+  }
+
+  async function totpEnroll(request: Request): Promise<Response> {
+    if (!totpOptions) return response({ error: "not_found" }, 404);
+    const user = await getSession(request);
+    if (!user) return response({ error: "unauthenticated" }, 401);
+    const existing = await totpOptions.store.get(user.id);
+    if (existing?.confirmed) return response({ error: "invalid_request" }, 400);
+    const secret = createTotpSecret();
+    const recoveryCodes = createRecoveryCodes(totpOptions.recoveryCodeCount);
+    const record: TotpRecord = {
+      secret,
+      confirmed: false,
+      recoveryCodeHashes: await Promise.all(recoveryCodes.map((code) => hashSessionToken(normalizeRecoveryCode(code)))),
+    };
+    await totpOptions.store.set(user.id, record);
+    const appUser = await options.users.findById(user.id);
+    if (!appUser) return response({ error: "unauthenticated" }, 401);
+    const accountLabel = appUser.email ?? appUser.username ?? appUser.id;
+    return response({
+      otpauthUri: createOtpauthUri({
+        issuer: totpOptions.issuer,
+        accountLabel,
+        secret,
+        digits: totpOptions.digits,
+        periodSeconds: totpOptions.periodSeconds,
+      }),
+      secret,
+      recoveryCodes,
+    }, 200);
+  }
+
+  async function totpConfirm(request: Request): Promise<Response> {
+    if (!totpOptions) return response({ error: "not_found" }, 404);
+    const user = await getSession(request);
+    if (!user) return response({ error: "unauthenticated" }, 401);
+    const code = parseOtpCode(objectFields(await readJson(request, maxRequestBytes)).code);
+    const record = await totpOptions.store.get(user.id);
+    if (!record || record.confirmed) return response({ error: "invalid_request" }, 400);
+    const valid = await verifyTotp({
+      secret: record.secret,
+      token: code,
+      digits: totpOptions.digits,
+      periodSeconds: totpOptions.periodSeconds,
+      skew: totpOptions.skew,
+      nowMs: Date.now(),
+    });
+    if (!valid) return response({ error: "invalid_request" }, 400);
+    await totpOptions.store.set(user.id, { ...record, confirmed: true });
+    return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+  }
+
+  async function totpDisable(request: Request): Promise<Response> {
+    if (!totpOptions) return response({ error: "not_found" }, 404);
+    const user = await getSession(request);
+    if (!user) return response({ error: "unauthenticated" }, 401);
+    const fields = objectFields(await readJson(request, maxRequestBytes));
+    const code = typeof fields.code === "string" ? fields.code : "";
+    const record = await totpOptions.store.get(user.id);
+    if (!record) return response({ error: "invalid_request" }, 400);
+    const appUser = await options.users.findById(user.id);
+    if (!appUser) return response({ error: "invalid_request" }, 400);
+    let verified = await verifyTotp({
+      secret: record.secret,
+      token: code,
+      digits: totpOptions.digits,
+      periodSeconds: totpOptions.periodSeconds,
+      skew: totpOptions.skew,
+      nowMs: Date.now(),
+    });
+    if (!verified && /^[A-Z2-7]{10}$/.test(code.toUpperCase().replace(/[ -]/g, ""))) {
+      verified = await totpOptions.store.consumeRecoveryCode(
+        user.id,
+        await hashSessionToken(normalizeRecoveryCode(code)),
+      );
+    }
+    if (!verified) return response({ error: "invalid_request" }, 400);
+    await totpOptions.store.delete(user.id);
+    return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+  }
+
+  async function totpVerify(request: Request): Promise<Response> {
+    if (!totpOptions) return response({ error: "not_found" }, 404);
+    const { challengeToken, code } = parseTotpVerifyRequest(await readJson(request, maxRequestBytes));
+    const consumed = await totpOptions.challengeTokens.consume({
+      purpose: "totp-challenge",
+      tokenHash: await hashSessionToken(challengeToken),
+      nowMs: Date.now(),
+    });
+    if (!consumed) return response({ error: "invalid_token" }, 400);
+    const user = await options.users.findById(consumed.userId);
+    if (!user) return response({ error: "invalid_token" }, 400);
+    const limited = await rateLimit("totp", await userIdentifier(user), request);
+    if (limited) return limited;
+    const record = await totpOptions.store.get(user.id);
+    if (!record?.confirmed) return response({ error: "invalid_credentials" }, 401);
+    let verified = await verifyTotp({
+      secret: record.secret,
+      token: code,
+      digits: totpOptions.digits,
+      periodSeconds: totpOptions.periodSeconds,
+      skew: totpOptions.skew,
+      nowMs: Date.now(),
+    });
+    if (!verified && /^[A-Z2-7]{10}$/.test(code.toUpperCase().replace(/[ -]/g, ""))) {
+      verified = await totpOptions.store.consumeRecoveryCode(
+        user.id,
+        await hashSessionToken(normalizeRecoveryCode(code)),
+      );
+    }
+    if (!verified) return response({ error: "invalid_credentials" }, 401);
+    if (options.emailVerification && !options.emailVerification.isVerified(user)) {
+      return response({ error: "invalid_credentials" }, 401);
+    }
+    return createSessionForUser(user);
+  }
+
+  async function magicLinkRequest(request: Request): Promise<Response> {
+    const flow = options.magicLink;
+    if (!flow) return response({ error: "not_found" }, 404);
+    const email = parseEmailRequest(await readJson(request, maxRequestBytes));
+    const limited = await rateLimit("magic-link", { type: "email", value: email }, request);
+    if (limited) return limited;
+    if (!(await passPolicies(email, request))) return response({ status: "accepted" }, 202);
+    const user = await options.users.findByEmail(email);
+    if (user) {
+      await issueActionToken(
+        "magic-link",
+        user.id,
+        requireEmail(user),
+        flow.tokens,
+        flow.delivery,
+        defaultMagicLinkTtlSeconds,
+        "magic-link.send",
+      );
+    }
+    return response({ status: "accepted" }, 202);
+  }
+
+  async function magicLinkConfirm(request: Request): Promise<Response> {
+    const flow = options.magicLink;
+    if (!flow) return response({ error: "not_found" }, 404);
+    const token = parseActionTokenRequest(await readJson(request, maxRequestBytes));
+    const consumed = await flow.tokens.consume({
+      purpose: "magic-link",
+      tokenHash: await hashSessionToken(token),
+      nowMs: Date.now(),
+    });
+    if (!consumed) return response({ error: "invalid_token" }, 400);
+    const user = await options.users.findById(consumed.userId);
+    if (!user) return response({ error: "invalid_token" }, 400);
+    const limited = await rateLimit("magic-link", await userIdentifier(user), request);
+    if (limited) return limited;
+    if ((options.emailVerification && !options.emailVerification.isVerified(user)) ||
+        !(await passPolicies(user.email, request))) {
+      return response({ error: "invalid_token" }, 400);
+    }
+    if (options.emailVerification) await options.emailVerification.markVerified(user.id);
     return createSessionForUser(user);
   }
 
@@ -449,6 +724,8 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     const stores = new Set<ExpiredRecordStore>([options.sessions]);
     if (options.emailVerification) stores.add(options.emailVerification.tokens);
     if (options.passwordReset) stores.add(options.passwordReset.tokens);
+    if (options.totp) stores.add(options.totp.challengeTokens);
+    if (options.magicLink) stores.add(options.magicLink.tokens);
     const nowMs = Date.now();
     try {
       await Promise.all([...stores].map((store) => store.deleteExpired({ nowMs, limit: 500 })));
@@ -468,8 +745,11 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
     if (route === "/session" && method === "GET") {
       if (!originIsAllowed(request) && request.headers.has("origin")) return response({ error: "invalid_origin" }, 403);
       try {
-        const user = await getSession(request);
-        return user ? response({ user }, 200) : response({ error: "unauthenticated" }, 401);
+        const resolved = await resolveRotatedSession(request);
+        if (!resolved) return response({ error: "unauthenticated" }, 401);
+        return resolved.setCookie
+          ? response({ user: resolved.user }, 200, { "Set-Cookie": resolved.setCookie })
+          : response({ user: resolved.user }, 200);
       } catch (error) {
         return errorResponse(error);
       }
@@ -514,9 +794,13 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
 
     const emailVerificationRoute = route === "/email-verification/request" || route === "/email-verification/confirm";
     const passwordResetRoute = route === "/password-reset/request" || route === "/password-reset/confirm";
+    const magicLinkRoute = route === "/magic-link/request" || route === "/magic-link/confirm";
+    const totpRoute = ["/totp/enroll", "/totp/confirm", "/totp/disable", "/totp/verify"].includes(route);
     const enabled = ["/register", "/login", "/logout"].includes(route) ||
       (emailVerificationRoute && !!options.emailVerification) ||
-      (passwordResetRoute && !!options.passwordReset);
+      (passwordResetRoute && !!options.passwordReset) ||
+      (magicLinkRoute && !!options.magicLink) ||
+      (totpRoute && !!options.totp);
     if (!enabled) return response({ error: "not_found" }, 404);
     if (method !== "POST") return response({ error: "method_not_allowed" }, 405, { Allow: "POST" });
     if (!originIsAllowed(request)) return response({ error: "invalid_origin" }, 403);
@@ -527,12 +811,18 @@ export function createAuth<User extends AuthUser>(options: AuthOptions<User>): A
       if (route === "/email-verification/request") return await requestEmailVerification(request);
       if (route === "/email-verification/confirm") return await confirmEmailVerification(request);
       if (route === "/password-reset/request") return await requestPasswordReset(request);
-      return await confirmPasswordReset(request);
+      if (route === "/password-reset/confirm") return await confirmPasswordReset(request);
+      if (route === "/magic-link/request") return await magicLinkRequest(request);
+      if (route === "/magic-link/confirm") return await magicLinkConfirm(request);
+      if (route === "/totp/enroll") return await totpEnroll(request);
+      if (route === "/totp/confirm") return await totpConfirm(request);
+      if (route === "/totp/disable") return await totpDisable(request);
+      return await totpVerify(request);
     } catch (error) {
       if (!(error instanceof RequestError)) await report(route.slice(1), error);
       return errorResponse(error);
     }
   }
 
-  return { handle, cleanupExpired, getSession, createSessionResponse };
+  return { handle, cleanupExpired, getSession, getSessionDetails, createSessionResponse };
 }

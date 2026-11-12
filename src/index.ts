@@ -1,10 +1,21 @@
 export { createAuth } from "./auth.js";
+export {
+  base32Decode,
+  base32Encode,
+  createOtpauthUri,
+  createRecoveryCodes,
+  createTotpSecret,
+  normalizeRecoveryCode,
+  verifyTotp,
+} from "./totp.js";
 export type {
   AccessPolicy,
   AuthActionTokenDelivery,
   AuthActionTokenPurpose,
   AuthActionTokenStore,
   AuthApi,
+  AuthRateLimitAction,
+  AuthenticatedSession,
   AuthenticatedUser,
   AuthOptions,
   AuthRateLimiter,
@@ -14,11 +25,15 @@ export type {
   CredentialVerifier,
   EmailVerificationOptions,
   LoginIdentityMode,
+  MagicLinkOptions,
   PasswordPolicy,
   RegistrationIdentityMode,
   ExpiredRecordStore,
   PasswordResetOptions,
   SessionStore,
   StoredSession,
+  TotpOptions,
+  TotpRecord,
+  TotpStore,
   UserStore,
 } from "./types.js";

@@ -2,7 +2,7 @@
 
 [Repository](https://github.com/orgShtora-1/auth) · [Issues](https://github.com/orgShtora-1/auth/issues)
 
-Framework-neutral authentication handlers and session management for Next.js and Cloudflare Workers. The core uses standard `Request`/`Response` APIs and Web Crypto; optional entry points add Cloudflare D1, OIDC, and WebAuthn support.
+Framework-neutral authentication handlers and session management for Next.js. The core uses standard `Request`/`Response` APIs and Web Crypto; optional entry points add OIDC and WebAuthn support.
 
 Your application owns its user records, credential verification, password hashing, email delivery, and persistent stores. The package does not hash, encrypt, or persist passwords and includes no ORM.
 
@@ -79,52 +79,6 @@ export const DELETE = (request: Request) => auth.handle(request);
 
 Use the real hostname in `allowedHosts`. Resolve client IPs only from a trusted hosting-platform or proxy value; do not parse arbitrary `X-Forwarded-For` input. Configure a shared, persistent rate limiter for public authentication endpoints.
 
-## Cloudflare Workers and D1
-
-Import D1 adapters from the dedicated entry point. The application still supplies its own user and credential adapters; D1 stores sessions and rate-limit counters in this example.
-
-```ts
-import { createAuth } from "@shtora/auth";
-import {
-  cleanupD1AuthState,
-  createD1RateLimiter,
-  createD1SessionStore,
-  type D1Database,
-} from "@shtora/auth/cloudflare";
-import { credentials, users } from "./auth-adapters";
-
-interface Env {
-  DB: D1Database;
-}
-
-let auth: ReturnType<typeof createAuth> | undefined;
-
-function getAuth(env: Env) {
-  return auth ??= createAuth({
-    users,
-    credentials,
-    sessions: createD1SessionStore(env.DB),
-    rateLimiter: createD1RateLimiter(env.DB, {
-      identifier: { limit: 5, windowSeconds: 60 },
-      ip: { limit: 100, windowSeconds: 60 },
-    }),
-    resolveClientIp: (request) => request.headers.get("cf-connecting-ip"),
-    allowedHosts: ["auth.example.com"],
-  });
-}
-
-export default {
-  fetch(request: Request, env: Env): Promise<Response> {
-    return getAuth(env).handle(request);
-  },
-
-  async scheduled(_controller: unknown, env: Env): Promise<void> {
-    await cleanupD1AuthState(env.DB, { rateLimitMaxWindowSeconds: 60 });
-  },
-};
-```
-
-The npm package omits SQL files; see the [Cloudflare D1 adapter](#cloudflare-d1-adapter) section for the pinned migration source and application instructions. D1 cleanup is bounded; schedule it often enough for your session and rate-limit volume. Workers Free and Paid use the same package code, subject to each plan's D1, storage, and CPU quotas.
 
 ## Routes
 
@@ -143,6 +97,12 @@ The default base path is `/api/auth`; set `basePath` to change it.
 | `POST` | `/api/auth/email-verification/confirm` | Optional; consumes a one-time token and marks the account verified. |
 | `POST` | `/api/auth/password-reset/request` | Optional; sends a reset message with an enumeration-resistant response. |
 | `POST` | `/api/auth/password-reset/confirm` | Optional; revokes sessions, then delegates the password update to the application. |
+| `POST` | `/api/auth/totp/enroll` | Optional; authenticated. Creates an unconfirmed enrollment and returns the otpauth URI, Base32 secret, and recovery codes. |
+| `POST` | `/api/auth/totp/confirm` | Optional; authenticated. Activates the enrollment with a valid current code. |
+| `POST` | `/api/auth/totp/verify` | Optional. Consumes a one-time login challenge and a valid code or recovery code, then sets a session. |
+| `POST` | `/api/auth/totp/disable` | Optional; authenticated. Removes the enrollment with a valid current code or recovery code. |
+| `POST` | `/api/auth/magic-link/request` | Optional; sends a magic link with an enumeration-resistant response. |
+| `POST` | `/api/auth/magic-link/confirm` | Optional; consumes a one-time magic link token and sets a session. |
 
 State-changing POST and DELETE requests require a same-origin `Origin` header by default. Read-only session GET requests allow a missing `Origin`. Keep this check enabled for browser cookie authentication unless equivalent CSRF protection is in place.
 ## Registration and login identifiers
@@ -156,11 +116,8 @@ createAuth({
   sessions,
   identity: { registration: "either", login: "either" },
   passwordPolicy: {
-    minLength: 12,
-    maxLength: 128,
-    requireUppercase: true,
-    requireLowercase: true,
-    requireSpecial: true,
+    minLength: 15,
+    maxLength: 4096,
   },
 });
 ```
@@ -173,9 +130,23 @@ Usernames are 3–32 ASCII letters, digits, `.`, `_`, or `-`; they are canonical
 
 `UserStore` results must contain exactly the configured identity shape before a session is created: email mode requires only email, username mode only username, both requires both, and either requires exactly one. Missing or invalid canonical identifiers fail closed and are reported through `onError`; no partial identity response is issued.
 
-The default password policy is min 1 and max 4096 Unicode code points, with uppercase/lowercase/special requirements disabled. Policy checks run during registration and password-reset confirmation, not login. Passwords are neither trimmed nor normalized. “Special” means a Unicode code point that is not a letter, number, or whitespace. The 4096-code-point hard cap is independent of the request-body byte limit. Invalid shape or policy returns the generic `400 { "error": "invalid_request" }`.
+The default password policy requires 15–4096 Unicode code points and applies no character-composition rules. Policy checks run during registration and password-reset confirmation, not login. Passwords are neither trimmed nor normalized. The 4096-code-point hard cap is independent of the request-body byte limit. Invalid shape or policy returns the generic `400 { "error": "invalid_request" }`. Applications that require passwords only as one factor of MFA may configure a lower minimum.
 
-Email verification requires registration mode `"email"` or `"both"` and rejects incompatible configurations at `createAuth`. Password-reset request remains email-address-only; username-only accounts and `"either"` accounts created without an email cannot request an email reset. `emailPolicy` denies email-less users, including session creation through OIDC. No additional migration is needed for this identity-mode change: D1 rate-limit table keys store only digests, with identifier kind included in the hashed key.
+Email verification requires registration mode `"email"` or `"both"` and rejects incompatible configurations at `createAuth`. Password-reset request remains email-address-only; username-only accounts and `"either"` accounts created without an email cannot request an email reset. `emailPolicy` denies email-less users, including session creation through OIDC.
+
+## Two-factor authentication (TOTP)
+
+TOTP is opt-in. Configure the `totp` option with a `TotpStore`, the action-token store to reuse as `challengeTokens`, and an `issuer` label for authenticator apps. Defaults are six digits, a 30-second period, a skew of 1, and 10 recovery codes; `digits` accepts 6 or 8, `periodSeconds` is a positive integer, `skew` is 0–10, and `recoveryCodeCount` is 1–100.
+
+Enrollment is session-scoped: `POST /api/auth/totp/enroll` returns `200` with `otpauthUri`, the Base32 `secret`, and single-use `recoveryCodes`, and stores an unconfirmed `TotpRecord` keyed by user ID. `POST /api/auth/totp/confirm` activates the record with a valid current code (`204`). Once confirmed, `POST /api/auth/login` with valid credentials returns `200 { totpRequired: true, challengeToken }` instead of a session cookie; the challenge is one-use and expires after five minutes. `POST /api/auth/totp/verify` accepts `{ challengeToken, code }`, where `code` is the current code or an unused recovery code, and then sets a session. `POST /api/auth/totp/disable` removes the record with a valid current code or recovery code. Recovery codes are returned once, in plaintext, at enrollment; the store persists only SHA-256 hashes, and `consumeRecoveryCode` must be atomic so each code works once.
+
+The core entry point exports the TOTP primitives - `verifyTotp`, `createTotpSecret`, `createRecoveryCodes`, `createOtpauthUri`, `base32Encode`, `base32Decode`, and `normalizeRecoveryCode` - for building authenticator integrations.
+
+## Magic link login
+
+Magic link login is opt-in. Configure the `magicLink` option with an `AuthActionTokenStore` and a delivery callback of the same shape as email verification; the token TTL is 900 seconds unless `tokenTtlSeconds` is set on the delivery.
+
+`POST /api/auth/magic-link/request` returns `202 { status: "accepted" }` for known and unknown addresses; for an existing address that passes the configured policies it delivers a raw token. `POST /api/auth/magic-link/confirm` consumes the token once, applies the same host, email, IP, and verification checks as login, and sets a session; an unknown, expired, or already-used token returns `400 { "error": "invalid_token" }`. With email verification enabled, unverified accounts are rejected at confirm, so verification must complete first.
 
 
 ## Email verification and password reset
@@ -192,16 +163,20 @@ Known and unknown addresses receive the same request response, though delivery t
 
 ## Security and storage contracts
 
+`auth.getSessionDetails(request)` returns the authenticated user with `createdAtMs` and `expiresAtMs` after the same session and policy checks as `getSession()`. Compare `createdAtMs` with an application-defined freshness window before sensitive actions. The package does not enforce step-up authentication on application routes.
+
 - The default `__Host-shtora.session` cookie is `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, and has no `Domain`. Cookie names must use the `__Host-` prefix.
 - Session cookies contain a random 256-bit token. `SessionStore` persists only its SHA-256 hash. Use storage with reliable revocation consistency; `deleteByIdForUser` must match both session and user IDs.
 - The default session lifetime is seven days (maximum one year). Request bodies are limited to 8 KiB by default; oversized cookie headers are treated as unauthenticated.
 - The application must hash passwords before storing them. `CredentialVerifier.verify` should do equivalent work for missing users to reduce account-enumeration timing differences. Never return password material through `AuthUser`.
-- Rate limiting is optional for core routes and should be configured for public deployments. OIDC and WebAuthn require a trusted client-IP resolver and request rate limiter; they fail closed when the IP is unavailable.
+- Core rate limiting is optional in the API but required for public deployments. Configure a shared, persistent limiter for registration, login, verification, and reset routes. OIDC and WebAuthn require a trusted client-IP resolver and request rate limiter; they fail closed when the IP is unavailable.
 - `resolveClientIp` must use a trusted proxy or platform header. Never trust arbitrary forwarded headers.
 - `allowedHosts` is an optional exact-authority allowlist. If omitted, reject unexpected hosts at the platform or proxy.
 - `onError({ operation, error })` observes unexpected adapter, policy, and delivery errors. HTTP responses remain generic. Avoid logging unreviewed adapter errors; they may contain sensitive values. Direct `getSession()` and `createSessionResponse()` calls reject adapter errors after notifying the observer.
+- `sessionIdleSeconds` extends the session expiry while the user is active, capped at the absolute `sessionTtlSeconds` lifetime; it requires `sessions.refreshExpiry`, which the package calls only with a later expiry.
+- `sessionRotationSeconds` issues a fresh session token once a session is older than that many seconds; the rotated token arrives in the `Set-Cookie` of the next `/session` response and the previous token is revoked.
+- `passwordBlocklist({ password, request })` runs during registration and password-reset confirmation; returning `true` rejects the password with the generic `400 { "error": "invalid_request" }`.
 
-The application also owns persistent storage for action tokens, OIDC transactions, WebAuthn challenges, and credentials. Their `consume` operations must be atomic and one-use; WebAuthn credential IDs must be unique and counter updates conditional on the stored counter. Expired-record cleanup methods must honor their supplied limit. See the exported TypeScript interfaces for the complete contracts.
 
 ## Optional protocols
 
@@ -213,23 +188,17 @@ The returned handler accepts GET `/start` and GET `/callback` paths. Mount it at
 
 ### WebAuthn and passkeys
 
-Import `createWebAuthn` and its types from `@shtora/auth/webauthn`. Required options are the exact `expectedOrigin` (HTTPS, or localhost HTTP for development), matching `rpID`, `rpName`, persistent one-use `challenges` and `credentials` stores, `resolveRegistrationUser`, `auth`, a trusted `resolveClientIp`, and a `rateLimiter`. `auth` is the `createAuth` result. Registration requires an authenticated application user with a stable, non-PII ID of at most 64 UTF-8 bytes.
+Import `createWebAuthn` and its types from `@shtora/auth/webauthn`. Required options are the exact `expectedOrigin` (HTTPS, or localhost HTTP for development), matching `rpID`, `rpName`, persistent one-use `challenges` and `credentials` stores, `resolveRegistrationUser`, `auth`, a trusted `resolveClientIp`, and a `rateLimiter`. `auth` is the `createAuth` result. Registration requires an authenticated application user with a stable, non-PII ID of at most 64 UTF-8 bytes. An optional `resolvePendingRegistrationUser` resolver supports passkey-first signup for users without an existing session; it must resolve the pending user from server-side state, never raw client input.
 
 Forward POST `/webauthn/registration/options`, `/webauthn/registration/verify`, `/webauthn/authentication/options`, and `/webauthn/authentication/verify` to the returned handler. It verifies the configured origin and RP ID, requires user verification, and uses one-use challenges. Credential IDs must be unique and counter updates atomic compare-and-set operations. Schedule the returned `cleanupExpired()` method.
 
 ## Public entry points
 
-- `@shtora/auth`: `createAuth` and the core types for users, credentials, sessions, rate limiting, policies, and optional email verification/password reset.
-- `@shtora/auth/cloudflare`: `D1Database`, D1 session/action-token stores, core and request rate limiters, and D1 auth-state cleanup.
+- `@shtora/auth`: `createAuth`, the core types for users, credentials, sessions, rate limiting, policies, email verification, password reset, TOTP, and magic link login, and the TOTP primitives `verifyTotp`, `createTotpSecret`, `createRecoveryCodes`, `createOtpauthUri`, `base32Encode`, `base32Decode`, and `normalizeRecoveryCode`.
 - `@shtora/auth/oidc`: `createOidc` and OIDC configuration, transaction-store, and handler types.
 - `@shtora/auth/webauthn`: `createWebAuthn` and WebAuthn challenge-store, credential-store, options, and user types.
 
 Install `openid-client` for `@shtora/auth/oidc` and `@simplewebauthn/server` for `@shtora/auth/webauthn`; these optional peer dependencies are not needed by the core entry point.
 
-## Cloudflare D1 adapter
-
-`@shtora/auth/cloudflare` exports `createD1SessionStore`, `createD1ActionTokenStore`, `createD1RateLimiter`, `createD1RequestRateLimiter`, and `cleanupD1AuthState`. `createD1RateLimiter` implements the core auth limiter for registration, login, email verification, and password reset; `createD1RequestRateLimiter` implements the separate request limiter required by OIDC and WebAuthn using `{ limit, windowSeconds }`. Both use hashed keys in the same `shtora_rate_limits` table.
-
-The npm package omits SQL files; apply migrations in filename order from the [pinned repository source](https://github.com/orgShtora-1/auth/tree/694089c260cdcc229b78b20a6b3a90f92eb38fd6/migrations), using `wrangler d1 execute <database-name> --remote --file <migration.sql>`. If schemas diverge in a later release, use the repository commit matching your installed package version. `cleanupD1AuthState` deletes bounded batches of expired sessions, action tokens, and rate-limit records; set `rateLimitMaxWindowSeconds` to at least the longest configured rate-limit window. D1 counters share one database and consume D1 write capacity. Cloudflare's Workers Rate Limit binding is location-local and approximate, not a globally strict limiter. See the [D1 Worker API](https://developers.cloudflare.com/d1/worker-api/d1-database/) and [Workers Rate Limit binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
 
 

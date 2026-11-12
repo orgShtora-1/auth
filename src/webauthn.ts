@@ -61,6 +61,8 @@ export interface WebAuthnOptions {
   credentials: WebAuthnCredentialStore;
   /** Return the authenticated application user for registration, or null. */
   resolveRegistrationUser(request: Request): Promise<WebAuthnUser | null>;
+  /** Optional resolver for passkey-first signup; must resolve from server-side pending-signup state, never raw client input. */
+  resolvePendingRegistrationUser?(request: Request): Promise<WebAuthnUser | null>;
   auth: Pick<AuthApi, "createSessionResponse">;
   resolveClientIp: (request: Request) => string | null | Promise<string | null>;
   rateLimiter: AuthRequestRateLimiter;
@@ -202,8 +204,15 @@ export function createWebAuthn(options: WebAuthnOptions): {
     return id;
   }
 
-  async function registrationOptions(request: Request): Promise<Response> {
+  async function resolveRegistrationUserForRequest(request: Request): Promise<WebAuthnUser | null> {
     const user = await options.resolveRegistrationUser(request);
+    if (user) return user;
+    const pending = options.resolvePendingRegistrationUser;
+    return pending ? await pending(request) : null;
+  }
+
+  async function registrationOptions(request: Request): Promise<Response> {
+    const user = await resolveRegistrationUserForRequest(request);
     if (!user || !user.id || !user.name || !user.displayName) return json({ error: "unauthenticated" }, 401);
     const userID = new TextEncoder().encode(user.id);
     if (userID.byteLength > 64) throw new RangeError("WebAuthn user IDs must not exceed 64 UTF-8 bytes");
@@ -224,7 +233,7 @@ export function createWebAuthn(options: WebAuthnOptions): {
   async function registrationVerify(request: Request): Promise<Response> {
     const body = await readJson(request);
     if (!body || typeof body.transactionId !== "string" || !body.response || typeof body.response !== "object") return reject();
-    const user = await options.resolveRegistrationUser(request);
+    const user = await resolveRegistrationUserForRequest(request);
     if (!user) return json({ error: "unauthenticated" }, 401);
     const transaction = await options.challenges.consume({
       id: body.transactionId,

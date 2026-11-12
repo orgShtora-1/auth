@@ -18,7 +18,6 @@ body:
       label: Runtime
       options:
         - Next.js
-        - Cloudflare Workers
         - Other
     validations:
       required: true
